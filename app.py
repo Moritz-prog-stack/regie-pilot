@@ -1,12 +1,6 @@
-import importlib
-import importlib.util
 import json
 import os
 import re
-import subprocess
-import sys
-import tempfile
-import time
 from datetime import date
 
 import streamlit as st
@@ -14,13 +8,13 @@ from fpdf import FPDF
 from google import genai
 from google.genai import errors, types
 
-# ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Einstellungen: Modellnamen nur HIER ändern
-# ---------------------------------------------------------------
-MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]  # erstes = Hauptmodell, Rest = Fallback
-RETRIES_PRO_MODELL = 2
+# ---------------------------------------------------------------------------
+MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]  # Erstes = Hauptmodell, Rest = Fallback
+RETRIES_PER_MODEL = 2
 RETRY_CODES = {429, 500, 503, 504}
-TIMEOUT_MS = 20000  # ein Versuch bricht nach 20 Sekunden ab
+TIMEOUT_MS = 25000
 
 GEWERKE = [
     "SHK (Sanitär, Heizung, Klima)",
@@ -31,415 +25,317 @@ GEWERKE = [
     "Trockenbau",
     "Fliesenleger",
     "Garten- & Landschaftsbau",
+    "Allgemeines Handwerk / Bau",
 ]
 
-PROMPT = """Du bist Assistent für einen deutschen Handwerksbetrieb im Gewerk: {gewerk}.
-Wandle die folgende unstrukturierte Baustellen-Notiz in einen Regiebericht um.
-Erfinde NICHTS dazu. Was nicht in der Notiz steht, bleibt leer ("" oder null).
-Alles, was unklar oder unvollständig ist (z. B. fehlende Pause, ungenaue Mengen,
-unklare Personenzahl), trägst du unter "hinweise" ein.
-
-Antworte NUR mit gültigem JSON in genau diesem Format:
-{{
-  "kunde_baustelle": "z. B. Familie Weber, Keller",
-  "mitarbeiter": ["Namen, falls genannt"],
-  "anzahl_mitarbeiter": 1,
-  "stunden_pro_mitarbeiter": 0.0,
-  "pause_minuten": 0,
-  "taetigkeiten": ["kurze, abrechnungsfähige Beschreibung je Tätigkeit"],
-  "material": [{{"bezeichnung": "", "menge": 0, "einheit": "m / Stk / ..."}}],
-  "hinweise": ["Unklarheiten oder fehlende Angaben, die der Chef prüfen sollte"]
-}}
-
-Notiz:
-{notiz}
-"""
+st.set_page_config(
+    page_title="Regie-Pilot | Regiebericht per KI",
+    page_icon="🛠️",
+    layout="centered",
+)
 
 
-# ---------------------------------------------------------------
-# Hilfsfunktionen
-# ---------------------------------------------------------------
-def to_float(x, default=0.0) -> float:
-    try:
-        if isinstance(x, str):
-            x = x.replace(",", ".").strip()
-        return float(x)
-    except (TypeError, ValueError):
-        return default
-
-
-def as_list(x) -> list:
-    if x is None:
-        return []
-    if isinstance(x, (list, tuple)):
-        return [str(i).strip() for i in x if str(i).strip()]
-    return [str(x).strip()] if str(x).strip() else []
-
-
-def normalisiere(d) -> dict:
-    """Macht aus der KI-Antwort ein sauberes, vorhersagbares Dictionary."""
-    if not isinstance(d, dict):
-        raise ValueError("KI-Antwort ist kein JSON-Objekt")
-
-    material = []
-    for m in d.get("material") or []:
-        if isinstance(m, dict):
-            menge = m.get("menge")
-            material.append(
-                {
-                    "Bezeichnung": str(m.get("bezeichnung") or ""),
-                    "Menge": "" if menge is None else str(menge),
-                    "Einheit": str(m.get("einheit") or ""),
-                }
-            )
-
-    mitarbeiter = as_list(d.get("mitarbeiter"))
-    anzahl = int(to_float(d.get("anzahl_mitarbeiter"), 1))
-    anzahl = max(anzahl, len(mitarbeiter), 1)
-
-    return {
-        "kunde_baustelle": str(d.get("kunde_baustelle") or ""),
-        "mitarbeiter": mitarbeiter,
-        "anzahl_mitarbeiter": anzahl,
-        "stunden": max(to_float(d.get("stunden_pro_mitarbeiter")), 0.0),
-        "pause_minuten": max(int(to_float(d.get("pause_minuten"))), 0),
-        "taetigkeiten": as_list(d.get("taetigkeiten")),
-        "material": material,
-        "hinweise": as_list(d.get("hinweise")),
+def bereinige_text(text: str) -> str:
+    """Macht deutsche Umlaute und Sonderzeichen für FPDF2 Standard-Schriften sicher."""
+    if not text:
+        return ""
+    ersetzungen = {
+        "€": "EUR",
+        "–": "-",
+        "—": "-",
+        "„": '"',
+        "“": '"',
+        "‚": "'",
+        "‘": "'",
+        "…": "...",
+        "•": "-",
     }
+    for alt, neu in ersetzungen.items():
+        text = text.replace(alt, neu)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
 
 
-def parse_json(text: str) -> dict:
-    text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
-    return json.loads(text)
+def hole_api_key() -> str:
+    """Lädt den API-Key bevorzugt aus Streamlit Secrets, sonst aus Umgebung oder Eingabe."""
+    if "GEMINI_API_KEY" in st.secrets:
+        return st.secrets["GEMINI_API_KEY"]
+    env_key = os.environ.get("GEMINI_API_KEY", "")
+    if env_key:
+        return env_key
+    return st.text_input("Gemini API-Key (nur nötig, falls noch nicht in Secrets hinterlegt)", type="password")
 
 
-# ---------------------------------------------------------------
-# Gemini-Aufruf mit Retry und Fallback-Modell
-# ---------------------------------------------------------------
-def get_api_key() -> str:
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        pass
-    return os.environ.get("GEMINI_API_KEY", "")
-
-
-def call_gemini(api_key: str, prompt: str) -> tuple[dict, str]:
-    client = genai.Client(
-        api_key=api_key, http_options=types.HttpOptions(timeout=TIMEOUT_MS)
-    )
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json", temperature=0.2
-    )
-    last_error = None
-    for model in MODELS:
-        for versuch in range(RETRIES_PRO_MODELL):
-            try:
-                resp = client.models.generate_content(
-                    model=model, contents=prompt, config=config
-                )
-                return normalisiere(parse_json(resp.text)), model
-            except errors.APIError as e:
-                last_error = e
-                if e.code in RETRY_CODES:
-                    time.sleep(1 + versuch)  # 1s, 2s
-                    continue
-                break  # z. B. 404 (Modell abgeschaltet) -> sofort nächstes Modell
-            except ValueError as e:  # kein sauberes JSON -> nochmal versuchen
-                last_error = e
-                continue
-            except Exception as e:  # z. B. Timeout -> nächstes Modell
-                last_error = e
-                break
-    raise RuntimeError(f"Alle Modelle fehlgeschlagen. Letzter Fehler: {last_error}")
-
-
-# ---------------------------------------------------------------
-# PDF
-# ---------------------------------------------------------------
-def t(s) -> str:
-    """Text PDF-sicher machen (Standardschrift kann nur Latin-1)."""
-    s = "" if s is None else str(s)
-    for a, b in {
-        "–": "-", "—": "-", "€": "EUR", "„": '"', "“": '"', "”": '"', "’": "'", "•": "-",
-    }.items():
-        s = s.replace(a, b)
-    return s.encode("latin-1", "replace").decode("latin-1")
-
-
-def fmt(zahl: float) -> str:
-    return f"{zahl:.2f}".replace(".", ",")
-
-
-def build_pdf(d: dict, firma: str, gewerk: str, stunden_netto: float, stundensatz: float) -> bytes:
-    anzahl = d["anzahl_mitarbeiter"]
-    gesamt_std = stunden_netto * anzahl
-
+def erstelle_pdf(daten: dict, gewerk: str, mit_unterschrift: bool, firma_name: str) -> bytes:
+    """Erzeugt ein sauber formatiertes Regiebericht-PDF."""
     pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
 
-    def zeile(text, h=6, bold=False):
-        pdf.set_font("Helvetica", "B" if bold else "", 10)
-        pdf.multi_cell(0, h, t(text), new_x="LMARGIN", new_y="NEXT")
-
-    def heading(text):
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_fill_color(230, 230, 230)
-        pdf.cell(0, 8, t(text), new_x="LMARGIN", new_y="NEXT", fill=True)
-
+    # Kopfbereich
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, "Regiebericht / Stundenlohnzettel", new_x="LMARGIN", new_y="NEXT")
-    if firma:
-        zeile(firma)
-    zeile(f"Datum: {date.today().strftime('%d.%m.%Y')}   |   Gewerk: {gewerk}")
-    zeile(f"Baustelle / Kunde: {d['kunde_baustelle'] or '-'}")
-    pdf.ln(4)
+    pdf.cell(0, 10, bereinige_text("REGIEBERICHT / STUNDENLOHNZETTEL"), ln=True)
 
-    heading("Arbeitszeit")
-    namen = ", ".join(d["mitarbeiter"]) if d["mitarbeiter"] else f"{anzahl} Mitarbeiter"
-    zeile(f"Mitarbeiter: {namen}")
-    zeile(f"Stunden je Mitarbeiter: {fmt(stunden_netto)} h   |   Pause: {d['pause_minuten']} min")
-    zeile(f"Gesamtstunden: {fmt(gesamt_std)} h", bold=True)
-    if stundensatz > 0:
-        zeile(f"Lohnkosten ({fmt(stundensatz)} EUR/h netto): {fmt(gesamt_std * stundensatz)} EUR", bold=True)
-    pdf.ln(4)
-
-    heading("Ausgeführte Arbeiten")
-    for x in d["taetigkeiten"] or ["-"]:
-        zeile(f"- {x}")
-    pdf.ln(4)
-
-    heading("Material")
-    if d["material"]:
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(110, 6, "Bezeichnung", border=1)
-        pdf.cell(35, 6, "Menge", border=1)
-        pdf.cell(35, 6, "Einheit", border=1, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 10)
-        for m in d["material"]:
-            pdf.cell(110, 6, t(m["Bezeichnung"])[:60], border=1)
-            pdf.cell(35, 6, t(m["Menge"])[:15], border=1)
-            pdf.cell(35, 6, t(m["Einheit"])[:15], border=1, new_x="LMARGIN", new_y="NEXT")
-    else:
-        zeile("Kein Material angegeben.")
-    pdf.ln(14)
-
-    y = pdf.get_y()
-    pdf.line(10, y, 90, y)
-    pdf.line(110, y, 190, y)
-    pdf.set_y(y + 1)
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(100, 6, "Unterschrift Auftragnehmer")
-    pdf.cell(0, 6, "Unterschrift Auftraggeber", new_x="LMARGIN", new_y="NEXT")
+    if firma_name.strip():
+        pdf.cell(0, 6, bereinige_text(f"Ausführender Betrieb: {firma_name.strip()}"), ln=True)
+    pdf.cell(0, 6, bereinige_text(f"Gewerk: {gewerk}   |   Datum: {daten.get('datum', date.today().strftime('%d.%m.%Y'))}"), ln=True)
+    pdf.ln(4)
+
+    # Trennlinie
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(5)
+
+    # Kunde & Baustelle
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, bereinige_text("1. Kunde & Baustelle"), ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, bereinige_text(f"Kunde / Auftraggeber: {daten.get('kunde', '-')}"), ln=True)
+    pdf.cell(0, 6, bereinige_text(f"Baustelle / Einsatzort: {daten.get('baustelle', '-')}"), ln=True)
+    pdf.ln(4)
+
+    # Ausgeführte Arbeiten
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, bereinige_text("2. Ausgeführte Arbeiten"), ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    arbeiten = daten.get("arbeiten", [])
+    if arbeiten:
+        for punkt in arbeiten:
+            pdf.multi_cell(0, 6, bereinige_text(f"- {punkt}"))
+    else:
+        pdf.multi_cell(0, 6, bereinige_text("- Keine Tätigkeiten angegeben."))
+    pdf.ln(4)
+
+    # Arbeitszeiten & Personal
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, bereinige_text("3. Arbeitszeiten & Mitarbeiter"), ln=True)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(75, 7, bereinige_text("Mitarbeiter / Qualifikation"), border=1, fill=True)
+    pdf.cell(45, 7, bereinige_text("Zeitraum"), border=1, fill=True)
+    pdf.cell(30, 7, bereinige_text("Pause (Min)"), border=1, fill=True)
+    pdf.cell(40, 7, bereinige_text("Netto-Stunden"), border=1, fill=True, ln=True)
+
+    pdf.set_font("Helvetica", "", 10)
+    mitarbeiter = daten.get("mitarbeiter", [])
+    gesamt_stunden = 0.0
+    if mitarbeiter:
+        for m in mitarbeiter:
+            std = float(m.get("netto_stunden", 0))
+            gesamt_stunden += std
+            pdf.cell(75, 7, bereinige_text(str(m.get("name", "Monteur"))), border=1)
+            pdf.cell(45, 7, bereinige_text(str(m.get("zeitraum", "-"))), border=1)
+            pdf.cell(30, 7, bereinige_text(str(m.get("pause_min", 0))), border=1)
+            pdf.cell(40, 7, bereinige_text(f"{std:.2f} Std."), border=1, ln=True)
+    else:
+        pdf.cell(190, 7, bereinige_text("Keine Arbeitszeiten erfasst"), border=1, ln=True)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(150, 7, bereinige_text("Gesamtstunden:"), border=1, align="R")
+    pdf.cell(40, 7, bereinige_text(f"{gesamt_stunden:.2f} Std."), border=1, ln=True)
+    pdf.ln(5)
+
+    # Verbrauchtes Material
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, bereinige_text("4. Verbrauchtes Material"), ln=True)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(35, 7, bereinige_text("Menge"), border=1, fill=True)
+    pdf.cell(155, 7, bereinige_text("Materialbezeichnung"), border=1, fill=True, ln=True)
+
+    pdf.set_font("Helvetica", "", 10)
+    material = daten.get("material", [])
+    if material:
+        for item in material:
+            pdf.cell(35, 7, bereinige_text(str(item.get("menge", "-"))), border=1)
+            pdf.cell(155, 7, bereinige_text(str(item.get("bezeichnung", "-"))), border=1, ln=True)
+    else:
+        pdf.cell(190, 7, bereinige_text("Kein Material verbraucht / angegeben"), border=1, ln=True)
+    pdf.ln(5)
+
+    # Hinweise / Mängel / Nachträge
+    hinweise = daten.get("hinweise", "").strip()
+    if hinweise:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, bereinige_text("5. Besondere Hinweise / Nachträge"), ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, bereinige_text(hinweise))
+        pdf.ln(6)
+
+    # Unterschriftsfeld
+    if mit_unterschrift:
+        pdf.ln(8)
+        y_pos = pdf.get_y()
+        pdf.line(10, y_pos, 90, y_pos)
+        pdf.line(115, y_pos, 195, y_pos)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(105, 5, bereinige_text("Datum, Unterschrift Monteur / Bauleiter"))
+        pdf.cell(85, 5, bereinige_text("Datum, Unterschrift Auftraggeber / Kunde"), ln=True)
 
     return bytes(pdf.output())
 
 
-# ---------------------------------------------------------------
-# Sprachnotiz -> Text (lokal mit faster-whisper)
-# ---------------------------------------------------------------
-@st.cache_resource(show_spinner="Spracherkennung wird geladen ...")
-def load_whisper():
-    """Lädt das Whisper-Modell nur einmal und hält es im Speicher."""
-    from faster_whisper import WhisperModel
+def analysiere_eingabe(client: genai.Client, gewerk: str, text_notiz: str, audio_bytes: bytes | None, audio_mime: str | None) -> tuple[dict, str]:
+    """Sendet Text und/oder Sprachaufnahme an Gemini und gibt strukturierte JSON-Daten zurück."""
+    heute = date.today().strftime("%d.%m.%Y")
+    system_prompt = f"""
+Du bist ein erfahrener deutscher Bauleiter und Abrechnungs-Experte für das Gewerk "{gewerk}".
+Analysiere die Baustellen-Notiz (Text und/oder Sprachaufnahme) und wandle sie in einen abrechnungsfertigen Regiebericht um.
+Heutiges Datum (falls kein anderes genannt wird): {heute}.
 
-    return WhisperModel("tiny", device="cpu", compute_type="int8")
+Wichtige Regeln:
+- Formuliere die ausgeführten Arbeiten fachgerecht, klar und kundenfreundlich auf Deutsch (perfekt für eine Rechnung).
+- Berechne die Netto-Stunden pro Mitarbeiter exakt (Bruttozeit minus Pause in Stunden als Dezimalzahl, z. B. 7.75 für 7 Std. 45 Min.).
+- Falls mehrere Monteure genannt werden (z. B. "Lukas und ich"), führe beide getrennt in der Mitarbeiterliste auf.
+- Trenne Mengen und Materialbezeichnungen sauber.
+- Antworte AUSSCHLIESSLICH mit validem JSON exakt nach diesem Schema:
+{{
+  "datum": "TT.MM.JJJJ",
+  "kunde": "Name des Kunden oder 'Nicht angegeben'",
+  "baustelle": "Adresse oder Einsatzort oder 'Nicht angegeben'",
+  "arbeiten": ["Fachgerechter Tätigkeitspunkt 1", "Fachgerechter Tätigkeitspunkt 2"],
+  "mitarbeiter": [
+    {{
+      "name": "Name oder Rolle (z. B. Monteur 1)",
+      "zeitraum": "z. B. 07:30 - 16:00 Uhr",
+      "pause_min": 45,
+      "netto_stunden": 7.75
+    }}
+  ],
+  "material": [
+    {{
+      "menge": "z. B. 3 m",
+      "bezeichnung": "Kupferrohr 22 mm"
+    }}
+  ],
+  "hinweise": "Besondere Hinweise, Restarbeiten, Mängel oder leerer String"
+}}
+"""
 
+    contents = [system_prompt]
+    if audio_bytes and audio_mime:
+        contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime))
+    if text_notiz.strip():
+        contents.append(f"Zusätzliche Text-Notiz vom Monteur:\n{text_notiz.strip()}")
 
-def stelle_paket_sicher(modul: str, pip_name: str) -> None:
-    """Installiert ein fehlendes Paket automatisch in genau die Python-Umgebung,
-    in der diese App läuft (sys.executable)."""
-    try:
-        vorhanden = importlib.util.find_spec(modul) is not None
-    except (ImportError, ValueError):
-        vorhanden = False
-    if vorhanden:
-        return
-    res = subprocess.run(
-        [sys.executable, "-m", "pip", "install", pip_name],
-        capture_output=True,
-        text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if res.returncode != 0:
-        raise RuntimeError(f"Installation von {pip_name} fehlgeschlagen: {res.stderr[-300:]}")
-    importlib.invalidate_caches()
+    letzter_fehler = None
+    for modell in MODELS:
+        for _ in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=modell,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    ),
+                )
+                roh_text = response.text.strip()
+                roh_text = re.sub(r"^```json\s*|\s*```$", "", roh_text)
+                return json.loads(roh_text), modell
+            except errors.APIError as e:
+                letzter_fehler = e
+                if e.code not in RETRY_CODES:
+                    raise
+            except Exception as e:
+                letzter_fehler = e
 
-
-def lade_audio(pfad: str):
-    """Dekodiert jedes Audioformat mit dem mitgelieferten ffmpeg (imageio-ffmpeg)
-    zu 16-kHz-Mono. So braucht die Erkennung kein funktionierendes PyAV."""
-    stelle_paket_sicher("imageio_ffmpeg", "imageio-ffmpeg")
-    stelle_paket_sicher("numpy", "numpy")
-    import imageio_ffmpeg
-    import numpy as np
-
-    cmd = [
-        imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-i", pfad,
-        "-f", "s16le", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-",
-    ]
-    res = subprocess.run(
-        cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    )
-    if res.returncode != 0 or not res.stdout:
-        raise RuntimeError("ffmpeg konnte die Datei nicht lesen: " + res.stderr.decode(errors="replace")[-300:])
-    return np.frombuffer(res.stdout, np.int16).astype(np.float32) / 32768.0
-
-
-def transkribiere(datei) -> str:
-    """Speichert die hochgeladene Audiodatei temporär und transkribiert sie auf Deutsch."""
-    endung = os.path.splitext(datei.name)[1].lower() or ".wav"
-    pfad = None
-    fehler = []
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=endung) as tmp:
-            tmp.write(datei.getvalue())
-            pfad = tmp.name
-
-        # Weg 1: selbst dekodieren (unabhängig von PyAV). Weg 2: faster-whisper liest die Datei selbst.
-        try:
-            quelle = lade_audio(pfad)
-        except Exception as e:
-            fehler.append(f"Dekodieren: {type(e).__name__}: {e}")
-            quelle = pfad
-
-        try:
-            model = load_whisper()
-            segmente, _info = model.transcribe(quelle, language="de")
-            text = " ".join(s.text.strip() for s in segmente).strip()
-        except Exception as e:
-            fehler.append(f"Erkennung: {type(e).__name__}: {e}")
-            raise RuntimeError(" | ".join(fehler))
-    finally:
-        if pfad and os.path.exists(pfad):
-            os.remove(pfad)
-    if not text:
-        raise ValueError("In der Sprachnotiz wurde keine Sprache erkannt.")
-    return text
+    raise RuntimeError(f"KI-Anfrage fehlgeschlagen: {letzter_fehler}")
 
 
-def versionen() -> str:
-    teile = [f"Python {sys.version.split()[0]}: {sys.executable}"]
-    for modul in ("streamlit", "faster_whisper", "av", "imageio_ffmpeg", "numpy"):
-        try:
-            m = importlib.import_module(modul)
-            teile.append(f"{modul}: {getattr(m, '__version__', 'installiert')}")
-        except Exception:
-            teile.append(f"{modul}: NICHT INSTALLIERT")
-    return "\n".join(teile)
-
-
-# ---------------------------------------------------------------
-# Oberfläche
-# ---------------------------------------------------------------
-st.set_page_config(page_title="Regie-Pilot", page_icon="🛠️")
+# ---------------------------------------------------------------------------
+# Benutzeroberfläche (UI)
+# ---------------------------------------------------------------------------
 st.title("🛠️ Regie-Pilot: WhatsApp-Chaos zu Regiebericht")
-st.caption("Version 2 – Abrechnungsfertiger Regiebericht & PDF-Stundenlohnzettel in Sekunden.")
+st.caption("Abrechnungsfertiger Regiebericht & PDF-Stundenlohnzettel in Sekunden – per Sprache oder Text.")
 
-api_key = get_api_key()
-if not api_key:
-    api_key = st.text_input("Gemini API-Key", type="password")
+api_key = hole_api_key()
 
 gewerk = st.selectbox("1. Gewerk auswählen:", GEWERKE)
 
-audio = st.file_uploader(
-    "🎤 Sprachnotiz hochladen (optional)",
-    type=["mp3", "wav", "m4a", "ogg"],
-)
-if audio is not None:
-    audio_id = f"{audio.name}-{audio.size}"
-    if st.session_state.get("audio_id") != audio_id:
-        try:
-            with st.spinner("Sprachnotiz wird transkribiert ..."):
-                st.session_state["notiz_text"] = transkribiere(audio)
-            st.session_state["audio_id"] = audio_id
-        except Exception as e:
-            st.error(f"Fehler bei der Spracherkennung: {e}")
-            with st.expander("Technische Details"):
-                st.code(versionen())
-            if "metadata_errors" in str(e):
-                st.info(
-                    "Die Audio-Bibliothek 'av' ist zu alt für faster-whisper. "
-                    "Ein Klick auf den Button aktualisiert beide Pakete."
-                )
-                if st.button("🔧 Bibliotheken jetzt aktualisieren", key="fix_av"):
-                    with st.spinner("Pakete werden aktualisiert ..."):
-                        res = subprocess.run(
-                            [sys.executable, "-m", "pip", "install", "--upgrade", "av", "faster-whisper"],
-                            capture_output=True,
-                            text=True,
-                        )
-                    if res.returncode == 0:
-                        st.success(
-                            "Aktualisiert. Beende Streamlit jetzt mit Strg+C in der "
-                            "Eingabeaufforderung und starte es neu: streamlit run app.py"
-                        )
-                    else:
-                        st.code((res.stdout + res.stderr)[-1500:])
-    if st.session_state.get("audio_id") == audio_id:
-        st.caption("Text aus der Sprachnotiz übernommen – du kannst ihn unten noch korrigieren.")
-else:
-    st.session_state.pop("audio_id", None)
+st.markdown("### 2. Sprachnotiz direkt einsprechen (oder Text eingeben)")
+audio_aufnahme = st.audio_input("🎙️ Mikrofon antippen und Baustellen-Bericht einsprechen")
 
-notiz = st.text_area(
-    "2. Baustellen-Notiz eingeben (wie bei WhatsApp):",
-    placeholder="Jo, Chef waren heute bei Familie Weber im Keller. 8,5 Std gearbeitet, Pause 30 min ...",
-    height=150,
-    key="notiz_text",
+with st.expander("📁 Optional: Vorhandene Audio-Datei hochladen (MP3, WAV, M4A, OGG)"):
+    audio_upload = st.file_uploader("Audiodatei auswählen", type=["mp3", "wav", "m4a", "ogg"])
+
+text_notiz = st.text_area(
+    "✍️ Baustellen-Notiz als Text (optional oder ergänzend):",
+    placeholder="z. B.: Moin Chef, waren heute bei Familie König in Düren, Lukas und ich von 07:30 bis 16:00 Uhr, 45 Min Pause. Neue Umwälzpumpe Grundfos Alpha2 eingebaut, 3m Kupferrohr 22mm verbraucht...",
+    height=130,
 )
 
-with st.expander("Optionen für den Stundenlohnzettel"):
-    firma = st.text_input("Firmenname (erscheint im PDF)")
-    stundensatz = st.number_input(
-        "Stundensatz netto in EUR (0 = nicht anzeigen)", min_value=0.0, value=0.0, step=5.0
-    )
-    pause_abziehen = st.checkbox("Pause von den genannten Stunden abziehen", value=False)
+with st.expander("⚙️ Optionen für den Stundenlohnzettel / PDF"):
+    firma_name = st.text_input("Eigener Firmenname im Briefkopf (optional):", placeholder="z. B. Mustermann Haustechnik GmbH")
+    mit_unterschrift = st.checkbox("Unterschriftsfelder für Monteur & Kunde ins PDF drucken", value=True)
 
-if st.button("⚡ Regiebericht & PDF erstellen", type="primary"):
+if st.button("🚀 Regiebericht & PDF erstellen", type="primary", use_container_width=True):
     if not api_key:
-        st.error("Bitte zuerst den API-Key eintragen.")
-    elif not notiz.strip():
-        st.warning("Bitte eine Baustellen-Notiz eingeben.")
-    else:
-        try:
-            with st.spinner("KI erstellt den Regiebericht ..."):
-                daten, modell = call_gemini(api_key, PROMPT.format(gewerk=gewerk, notiz=notiz))
-            std = daten["stunden"]
-            if pause_abziehen:
-                std -= daten["pause_minuten"] / 60
-            pdf_bytes = build_pdf(daten, firma, gewerk, max(std, 0.0), stundensatz)
-            st.session_state["ergebnis"] = {"daten": daten, "pdf": pdf_bytes, "modell": modell}
-        except Exception as e:
-            st.session_state.pop("ergebnis", None)
-            st.error(f"Fehler bei der Verarbeitung: {e}")
+        st.error("Bitte hinterlege zuerst deinen Gemini API-Key in den Streamlit Secrets.")
+        st.stop()
 
-# Ergebnis bleibt sichtbar, auch nach Klick auf den Download-Button
-erg = st.session_state.get("ergebnis")
-if erg:
-    d = erg["daten"]
-    st.success(f"Fertig (Modell: {erg['modell']})")
-    st.subheader("Regiebericht")
-    st.write(f"**Baustelle / Kunde:** {d['kunde_baustelle'] or '-'}")
-    st.write(
-        f"**Mitarbeiter:** {', '.join(d['mitarbeiter']) or d['anzahl_mitarbeiter']}  |  "
-        f"**Stunden je Mitarbeiter:** {d['stunden']} h  |  "
-        f"**Pause:** {d['pause_minuten']} min"
-    )
-    st.write("**Ausgeführte Arbeiten:**")
-    for x in d["taetigkeiten"]:
-        st.write(f"- {x}")
-    if d["material"]:
-        st.write("**Material:**")
-        st.table(d["material"])
-    for h in d["hinweise"]:
-        st.warning(h)
-    st.download_button(
-        "📄 PDF herunterladen",
-        data=erg["pdf"],
-        file_name=f"Regiebericht_{date.today().isoformat()}.pdf",
-        mime="application/pdf",
-    )
+    aktive_audio = audio_aufnahme if audio_aufnahme is not None else audio_upload
+    if aktive_audio is None and not text_notiz.strip():
+        st.warning("Bitte sprich zuerst eine kurze Sprachnotiz ein oder gib eine Text-Notiz ein.")
+        st.stop()
+
+    audio_bytes = None
+    audio_mime = None
+    if aktive_audio is not None:
+        audio_bytes = aktive_audio.getvalue()
+        audio_mime = getattr(aktive_audio, "type", None) or "audio/wav"
+
+    with st.spinner("KI wertet Baustellen-Bericht aus und erstellt PDF..."):
+        try:
+            client = genai.Client(api_key=api_key)
+            daten, verwendetes_modell = analysiere_eingabe(
+                client=client,
+                gewerk=gewerk,
+                text_notiz=text_notiz,
+                audio_bytes=audio_bytes,
+                audio_mime=audio_mime,
+            )
+            pdf_bytes = erstelle_pdf(
+                daten=daten,
+                gewerk=gewerk,
+                mit_unterschrift=mit_unterschrift,
+                firma_name=firma_name,
+            )
+
+            st.success(f"Fertig! Regiebericht erfolgreich erstellt (Modell: {verwendetes_modell})")
+
+            # Vorschau direkt in der App
+            col1, col2 = st.columns(2)
+            col1.metric("Kunde", daten.get("kunde", "-"))
+            col2.metric("Baustelle", daten.get("baustelle", "-"))
+
+            st.subheader("Ausgeführte Arbeiten")
+            for a in daten.get("arbeiten", []):
+                st.write(f"• {a}")
+
+            st.subheader("Arbeitszeiten")
+            for m in daten.get("mitarbeiter", []):
+                st.write(f"• **{m.get('name')}**: {m.get('zeitraum')} (Pause: {m.get('pause_min')} Min.) → **{m.get('netto_stunden')} Std.**")
+
+            if daten.get("material"):
+                st.subheader("Verbrauchtes Material")
+                for mat in daten.get("material", []):
+                    st.write(f"• {mat.get('menge')} – {mat.get('bezeichnung')}")
+
+            if daten.get("hinweise"):
+                st.info(f"**Hinweis:** {daten.get('hinweise')}")
+
+            # PDF-Download
+            kunde_sauber = re.sub(r"[^a-zA-Z0-9_-]", "_", daten.get("kunde", "Kunde"))
+            dateiname = f"Regiebericht_{kunde_sauber}_{date.today().strftime('%Y-%m-%d')}.pdf"
+
+            st.download_button(
+                label="📄 Regiebericht als PDF herunterladen",
+                data=pdf_bytes,
+                file_name=dateiname,
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
+
+        except Exception as fehler:
+            st.error(f"Beim Erstellen des Berichts ist ein Fehler aufgetreten: {fehler}")
