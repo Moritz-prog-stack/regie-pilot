@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from datetime import date
 
 import streamlit as st
@@ -9,12 +10,15 @@ from google import genai
 from google.genai import errors, types
 
 # ---------------------------------------------------------------------------
-# Einstellungen: Modellnamen nur HIER ändern
+# Einstellungen: Modell-Reihenfolge & automatische Wiederholung bei 503
 # ---------------------------------------------------------------------------
-MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]  # Erstes = Hauptmodell, Rest = Fallback
-RETRIES_PER_MODEL = 2
-RETRY_CODES = {429, 500, 503, 504}
-TIMEOUT_MS = 25000
+MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
+]
+RETRIES_PER_MODEL = 3
+RETRY_CODES = {429, 500, 502, 503, 504}
 
 GEWERKE = [
     "SHK (Sanitär, Heizung, Klima)",
@@ -68,53 +72,71 @@ def hole_api_key() -> str:
 def erstelle_pdf(daten: dict, gewerk: str, mit_unterschrift: bool, firma_name: str) -> bytes:
     """Erzeugt ein sauber formatiertes Regiebericht-PDF."""
     pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
+    breite = pdf.epw  # Nutzbare Seitenbreite (180 mm)
 
     # Kopfbereich
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, bereinige_text("REGIEBERICHT / STUNDENLOHNZETTEL"), ln=True)
+    pdf.cell(breite, 10, bereinige_text("REGIEBERICHT / STUNDENLOHNZETTEL"), ln=True)
 
     pdf.set_font("Helvetica", "", 10)
     if firma_name.strip():
-        pdf.cell(0, 6, bereinige_text(f"Ausführender Betrieb: {firma_name.strip()}"), ln=True)
-    pdf.cell(0, 6, bereinige_text(f"Gewerk: {gewerk}   |   Datum: {daten.get('datum', date.today().strftime('%d.%m.%Y'))}"), ln=True)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(breite, 6, bereinige_text(f"Ausführender Betrieb: {firma_name.strip()}"), ln=True)
+    pdf.set_x(pdf.l_margin)
+    pdf.cell(
+        breite,
+        6,
+        bereinige_text(f"Gewerk: {gewerk}   |   Datum: {daten.get('datum', date.today().strftime('%d.%m.%Y'))}"),
+        ln=True,
+    )
     pdf.ln(4)
 
     # Trennlinie
     pdf.set_draw_color(180, 180, 180)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + breite, pdf.get_y())
     pdf.ln(5)
 
     # Kunde & Baustelle
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, bereinige_text("1. Kunde & Baustelle"), ln=True)
+    pdf.cell(breite, 8, bereinige_text("1. Kunde & Baustelle"), ln=True)
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, bereinige_text(f"Kunde / Auftraggeber: {daten.get('kunde', '-')}"), ln=True)
-    pdf.cell(0, 6, bereinige_text(f"Baustelle / Einsatzort: {daten.get('baustelle', '-')}"), ln=True)
+    pdf.set_x(pdf.l_margin)
+    pdf.cell(breite, 6, bereinige_text(f"Kunde / Auftraggeber: {daten.get('kunde', '-')}"), ln=True)
+    pdf.set_x(pdf.l_margin)
+    pdf.cell(breite, 6, bereinige_text(f"Baustelle / Einsatzort: {daten.get('baustelle', '-')}"), ln=True)
     pdf.ln(4)
 
     # Ausgeführte Arbeiten
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, bereinige_text("2. Ausgeführte Arbeiten"), ln=True)
+    pdf.cell(breite, 8, bereinige_text("2. Ausgeführte Arbeiten"), ln=True)
     pdf.set_font("Helvetica", "", 10)
     arbeiten = daten.get("arbeiten", [])
     if arbeiten:
         for punkt in arbeiten:
-            pdf.multi_cell(0, 6, bereinige_text(f"- {punkt}"))
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(breite, 6, bereinige_text(f"- {punkt}"))
     else:
-        pdf.multi_cell(0, 6, bereinige_text("- Keine Tätigkeiten angegeben."))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(breite, 6, bereinige_text("- Keine Tätigkeiten angegeben."))
     pdf.ln(4)
 
-    # Arbeitszeiten & Personal
+    # Arbeitszeiten & Personal (Gesamtbreite = 180 mm)
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, bereinige_text("3. Arbeitszeiten & Mitarbeiter"), ln=True)
+    pdf.cell(breite, 8, bereinige_text("3. Arbeitszeiten & Mitarbeiter"), ln=True)
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 10)
     pdf.set_fill_color(240, 240, 240)
-    pdf.cell(75, 7, bereinige_text("Mitarbeiter / Qualifikation"), border=1, fill=True)
+    pdf.cell(70, 7, bereinige_text("Mitarbeiter / Qualifikation"), border=1, fill=True)
     pdf.cell(45, 7, bereinige_text("Zeitraum"), border=1, fill=True)
     pdf.cell(30, 7, bereinige_text("Pause (Min)"), border=1, fill=True)
-    pdf.cell(40, 7, bereinige_text("Netto-Stunden"), border=1, fill=True, ln=True)
+    pdf.cell(35, 7, bereinige_text("Netto-Stunden"), border=1, fill=True, ln=True)
 
     pdf.set_font("Helvetica", "", 10)
     mitarbeiter = daten.get("mitarbeiter", [])
@@ -123,59 +145,70 @@ def erstelle_pdf(daten: dict, gewerk: str, mit_unterschrift: bool, firma_name: s
         for m in mitarbeiter:
             std = float(m.get("netto_stunden", 0))
             gesamt_stunden += std
-            pdf.cell(75, 7, bereinige_text(str(m.get("name", "Monteur"))), border=1)
+            pdf.set_x(pdf.l_margin)
+            pdf.cell(70, 7, bereinige_text(str(m.get("name", "Monteur"))), border=1)
             pdf.cell(45, 7, bereinige_text(str(m.get("zeitraum", "-"))), border=1)
             pdf.cell(30, 7, bereinige_text(str(m.get("pause_min", 0))), border=1)
-            pdf.cell(40, 7, bereinige_text(f"{std:.2f} Std."), border=1, ln=True)
+            pdf.cell(35, 7, bereinige_text(f"{std:.2f} Std."), border=1, ln=True)
     else:
-        pdf.cell(190, 7, bereinige_text("Keine Arbeitszeiten erfasst"), border=1, ln=True)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(breite, 7, bereinige_text("Keine Arbeitszeiten erfasst"), border=1, ln=True)
 
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(150, 7, bereinige_text("Gesamtstunden:"), border=1, align="R")
-    pdf.cell(40, 7, bereinige_text(f"{gesamt_stunden:.2f} Std."), border=1, ln=True)
+    pdf.cell(145, 7, bereinige_text("Gesamtstunden:"), border=1, align="R")
+    pdf.cell(35, 7, bereinige_text(f"{gesamt_stunden:.2f} Std."), border=1, ln=True)
     pdf.ln(5)
 
-    # Verbrauchtes Material
+    # Verbrauchtes Material (Gesamtbreite = 180 mm)
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, bereinige_text("4. Verbrauchtes Material"), ln=True)
+    pdf.cell(breite, 8, bereinige_text("4. Verbrauchtes Material"), ln=True)
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(35, 7, bereinige_text("Menge"), border=1, fill=True)
-    pdf.cell(155, 7, bereinige_text("Materialbezeichnung"), border=1, fill=True, ln=True)
+    pdf.cell(145, 7, bereinige_text("Materialbezeichnung"), border=1, fill=True, ln=True)
 
     pdf.set_font("Helvetica", "", 10)
     material = daten.get("material", [])
     if material:
         for item in material:
+            pdf.set_x(pdf.l_margin)
             pdf.cell(35, 7, bereinige_text(str(item.get("menge", "-"))), border=1)
-            pdf.cell(155, 7, bereinige_text(str(item.get("bezeichnung", "-"))), border=1, ln=True)
+            pdf.cell(145, 7, bereinige_text(str(item.get("bezeichnung", "-"))), border=1, ln=True)
     else:
-        pdf.cell(190, 7, bereinige_text("Kein Material verbraucht / angegeben"), border=1, ln=True)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(breite, 7, bereinige_text("Kein Material verbraucht / angegeben"), border=1, ln=True)
     pdf.ln(5)
 
     # Hinweise / Mängel / Nachträge
-    hinweise = daten.get("hinweise", "").strip()
+    hinweise = str(daten.get("hinweise", "") or "").strip()
     if hinweise:
+        pdf.set_x(pdf.l_margin)
         pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, bereinige_text("5. Besondere Hinweise / Nachträge"), ln=True)
+        pdf.cell(breite, 8, bereinige_text("5. Besondere Hinweise / Nachträge"), ln=True)
+        pdf.set_x(pdf.l_margin)
         pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, bereinige_text(hinweise))
+        pdf.multi_cell(breite, 6, bereinige_text(hinweise))
         pdf.ln(6)
 
     # Unterschriftsfeld
     if mit_unterschrift:
         pdf.ln(8)
+        pdf.set_x(pdf.l_margin)
         y_pos = pdf.get_y()
-        pdf.line(10, y_pos, 90, y_pos)
-        pdf.line(115, y_pos, 195, y_pos)
+        pdf.line(pdf.l_margin, y_pos, pdf.l_margin + 80, y_pos)
+        pdf.line(pdf.l_margin + 100, y_pos, pdf.l_margin + breite, y_pos)
         pdf.set_font("Helvetica", "", 9)
-        pdf.cell(105, 5, bereinige_text("Datum, Unterschrift Monteur / Bauleiter"))
-        pdf.cell(85, 5, bereinige_text("Datum, Unterschrift Auftraggeber / Kunde"), ln=True)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(100, 5, bereinige_text("Datum, Unterschrift Monteur / Bauleiter"))
+        pdf.cell(80, 5, bereinige_text("Datum, Unterschrift Auftraggeber / Kunde"), ln=True)
 
     return bytes(pdf.output())
 
 
 def analysiere_eingabe(client: genai.Client, gewerk: str, text_notiz: str, audio_bytes: bytes | None, audio_mime: str | None) -> tuple[dict, str]:
-    """Sendet Text und/oder Sprachaufnahme an Gemini und gibt strukturierte JSON-Daten zurück."""
+    """Sendet Text und/oder Sprachaufnahme an Gemini mit automatischem Retry & Modell-Fallback."""
     heute = date.today().strftime("%d.%m.%Y")
     system_prompt = f"""
 Du bist ein erfahrener deutscher Bauleiter und Abrechnungs-Experte für das Gewerk "{gewerk}".
@@ -219,7 +252,7 @@ Wichtige Regeln:
 
     letzter_fehler = None
     for modell in MODELS:
-        for _ in range(RETRIES_PER_MODEL):
+        for versuch in range(RETRIES_PER_MODEL):
             try:
                 response = client.models.generate_content(
                     model=modell,
@@ -234,12 +267,17 @@ Wichtige Regeln:
                 return json.loads(roh_text), modell
             except errors.APIError as e:
                 letzter_fehler = e
-                if e.code not in RETRY_CODES:
-                    raise
+                if e.code == 404:
+                    break
+                if e.code in RETRY_CODES:
+                    time.sleep(2 * (versuch + 1))
+                    continue
+                raise
             except Exception as e:
                 letzter_fehler = e
+                time.sleep(1)
 
-    raise RuntimeError(f"KI-Anfrage fehlgeschlagen: {letzter_fehler}")
+    raise RuntimeError(f"Die KI-Server sind gerade stark ausgelastet. Bitte in 10 Sekunden nochmal tippen. (Details: {letzter_fehler})")
 
 
 # ---------------------------------------------------------------------------
