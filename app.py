@@ -11,7 +11,7 @@ from google.genai import errors, types
 # ---------------------------------------------------------------------------
 # Einstellungen: Modellnamen nur HIER ändern
 # ---------------------------------------------------------------------------
-MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]  # Erstes = Hauptmodell, Rest = Fallback
+MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]  # Erstes = Hauptmodell, Rest = Fallback
 RETRIES_PER_MODEL = 2
 RETRY_CODES = {429, 500, 503, 504}
 TIMEOUT_MS = 25000
