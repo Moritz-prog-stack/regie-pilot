@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -8,6 +9,8 @@ import streamlit as st
 from fpdf import FPDF
 from google import genai
 from google.genai import errors, types
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
 
 # ---------------------------------------------------------
 # Einstellungen: Modell-Reihenfolge & automatische Wiederholung
@@ -41,10 +44,9 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# Zugangsschutz (Firmen-Code)
+# Zugangsschutz (Firmen-Code: RP-7482-X)
 # ---------------------------------------------------------
 def check_access():
-    # Master-Code: RP-7482-X (weitere Kunden-Codes über Streamlit Secrets)
     allowed_codes = st.secrets.get("ACCESS_CODES", {"RP-7482-X": "Regie-Pilot Admin"})
 
     if "authenticated_company" not in st.session_state:
@@ -81,9 +83,10 @@ def get_gemini_client():
 
 
 def clean_pdf_text(text: str) -> str:
-    """Säubert Sonderzeichen, damit Standard-PDF-Schriften fehlerfrei rendern."""
+    """Säubert Sonderzeichen & lange Strings ohne Leerzeichen für fehlerfreies PDF-Rendering."""
     if not text:
         return "-"
+    text = str(text)
     replacements = {
         "€": "EUR",
         "–": "-",
@@ -93,10 +96,17 @@ def clean_pdf_text(text: str) -> str:
         "‚": "'",
         "’": "'",
         "•": "-",
+        "\t": " ",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
-    return text.encode("latin-1", "replace").decode("latin-1")
+    words = []
+    for word in text.split(" "):
+        if len(word) > 65:
+            word = " ".join(word[i : i + 65] for i in range(0, len(word), 65))
+        words.append(word)
+    safe_text = " ".join(words)
+    return safe_text.encode("latin-1", "replace").decode("latin-1")
 
 
 def analyze_audio_with_gemini(audio_bytes: bytes, mime_type: str, gewerk: str, extra_notes: str) -> dict:
@@ -154,6 +164,19 @@ Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt (ohne Markdown-Codeblöck
     raise RuntimeError(f"KI-Auswertung fehlgeschlagen: {last_error}")
 
 
+def extract_signature_bytes(canvas_image_data) -> bytes | None:
+    """Wandelt die gezeichnete Unterschrift vom Canvas in transparente/weiße PNG-Bytes um."""
+    if canvas_image_data is None:
+        return None
+    # Prüfen, ob tatsächlich Striche gezeichnet wurden (Alpha-Kanal > 0)
+    if canvas_image_data[:, :, 3].max() == 0:
+        return None
+    img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def build_regiebericht_pdf(
     firma: str,
     gewerk: str,
@@ -161,11 +184,14 @@ def build_regiebericht_pdf(
     daten: dict,
     unterzeichner_kunde: str = "",
     logo_bytes: bytes | None = None,
+    signature_bytes: bytes | None = None,
 ) -> bytes:
-    pdf = FPDF()
-    pdf.set_margins(15, 15, 15)
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(left=15, top=15, right=15)
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
+
+    full_w = 180.0
 
     # Optionales Firmenlogo oben rechts
     if logo_bytes:
@@ -173,93 +199,112 @@ def build_regiebericht_pdf(
         with open(tmp_logo, "wb") as f:
             f.write(logo_bytes)
         try:
-            pdf.image(tmp_logo, x=155, y=12, w=38)
+            pdf.image(tmp_logo, x=157, y=12, w=38)
         except Exception:
             pass
 
     # Kopfbereich
-    pdf.set_x(pdf.l_margin)
+    pdf.set_x(15)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(pdf.epw, 10, clean_pdf_text(firma), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(full_w, 10, clean_pdf_text(firma), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_x(15)
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(100, 100, 100)
-    pdf.cell(pdf.epw, 6, clean_pdf_text(f"Gewerk: {gewerk}  |  Datum: {datum_str}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(full_w, 6, clean_pdf_text(f"Gewerk: {gewerk}  |  Datum: {datum_str}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
-    pdf.ln(6)
+    pdf.ln(5)
 
     pdf.set_draw_color(40, 40, 40)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
     pdf.ln(6)
 
+    pdf.set_x(15)
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(pdf.epw, 9, "REGIEBERICHT / TAGESNACHWEIS", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(full_w, 9, "REGIEBERICHT / TAGESNACHWEIS", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
     # Stammdaten
-    label_w = 45
-    val_w = pdf.epw - label_w
+    label_w = 46.0
+    val_w = full_w - label_w
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(label_w, 7, "Auftraggeber / Kunde:")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(val_w, 7, clean_pdf_text(daten.get("kunde", "-")), new_x="LMARGIN", new_y="NEXT")
+    for label, key in [
+        ("Auftraggeber / Kunde:", "kunde"),
+        ("Baustelle / Einsatzort:", "baustelle"),
+        ("Arbeitszeit / Personal:", "arbeitszeit"),
+    ]:
+        pdf.set_x(15)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(label_w, 7, label)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(val_w, 7, clean_pdf_text(daten.get(key, "-")), new_x="LMARGIN", new_y="NEXT")
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(label_w, 7, "Baustelle / Einsatzort:")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(val_w, 7, clean_pdf_text(daten.get("baustelle", "-")), new_x="LMARGIN", new_y="NEXT")
-
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(label_w, 7, "Arbeitszeit / Personal:")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(val_w, 7, clean_pdf_text(daten.get("arbeitszeit", "-")), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(5)
+    pdf.ln(4)
 
     # Ausgeführte Arbeiten
-    pdf.set_x(pdf.l_margin)
+    pdf.set_x(15)
     pdf.set_fill_color(240, 242, 246)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(pdf.epw, 8, "  Ausgefuehrte Arbeiten", new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.cell(full_w, 8, "  Ausgefuehrte Arbeiten", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
     arbeiten = daten.get("ausgefuehrte_arbeiten") or ["Keine Angaben"]
     for item in arbeiten:
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(pdf.epw, 6, clean_pdf_text(f"- {item}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_x(15)
+        pdf.multi_cell(full_w, 6, clean_pdf_text(f"- {item}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     # Verwendetes Material
-    pdf.set_x(pdf.l_margin)
+    pdf.set_x(15)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(pdf.epw, 8, "  Verwendetes Material", new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.cell(full_w, 8, "  Verwendetes Material", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
     materialien = daten.get("material") or ["Kein Material angegeben"]
     for mat in materialien:
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(pdf.epw, 6, clean_pdf_text(f"- {mat}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_x(15)
+        pdf.multi_cell(full_w, 6, clean_pdf_text(f"- {mat}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     # Besonderheiten / Hinweise
-    pdf.set_x(pdf.l_margin)
+    pdf.set_x(15)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(pdf.epw, 8, "  Besonderheiten / Absprachen", new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.cell(full_w, 8, "  Besonderheiten / Absprachen", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
-    pdf.set_x(pdf.l_margin)
-    pdf.multi_cell(pdf.epw, 6, clean_pdf_text(daten.get("besonderheiten", "-")), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(14)
+    pdf.set_x(15)
+    pdf.multi_cell(full_w, 6, clean_pdf_text(daten.get("besonderheiten", "-")), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(18)
 
-    # Unterschriftsfelder
-    pdf.set_x(pdf.l_margin)
+    # Unterschriftsfelder (inkl. optionaler digitaler Touch-Unterschrift des Kunden)
+    if pdf.get_y() > 245:
+        pdf.add_page()
+        pdf.ln(15)
+
+    pdf.set_x(15)
     y_sig = pdf.get_y()
-    pdf.line(15, y_sig, 90, y_sig)
+
+    if signature_bytes:
+        tmp_sig = "/tmp/kunde_sig.png"
+        with open(tmp_sig, "wb") as f:
+            f.write(signature_bytes)
+        try:
+            pdf.image(tmp_sig, x=120, y=y_sig - 16, w=65, h=15)
+        except Exception:
+            pass
+
+    pdf.line(15, y_sig, 95, y_sig)
     pdf.line(115, y_sig, 195, y_sig)
     pdf.ln(2)
+    pdf.set_x(15)
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(100, 5, clean_pdf_text(f"Datum / Unterschrift {firma}"))
-    kunde_label = f"Unterschrift Auftraggeber ({unterzeichner_kunde})" if unterzeichner_kunde else "Unterschrift Auftraggeber / Bauleitung"
-    pdf.cell(pdf.epw - 100, 5, clean_pdf_text(kunde_label), new_x="LMARGIN", new_y="NEXT")
+    kunde_label = (
+        f"Unterschrift Auftraggeber ({unterzeichner_kunde})"
+        if unterzeichner_kunde
+        else "Unterschrift Auftraggeber / Bauleitung"
+    )
+    pdf.cell(80, 5, clean_pdf_text(kunde_label), new_x="LMARGIN", new_y="NEXT")
 
     return bytes(pdf.output())
 
@@ -309,11 +354,11 @@ if st.button("📄 Regiebericht erstellen", type="primary", use_container_width=
                 st.error(f"Fehler bei der Erstellung: {err}")
 
 # ---------------------------------------------------------
-# Ergebnis prüfen, anpassen & PDF herunterladen
+# Ergebnis prüfen, unterschreiben lassen & PDF herunterladen
 # ---------------------------------------------------------
 if "last_report" in st.session_state and st.session_state.last_report:
     st.divider()
-    st.subheader("2. Bericht prüfen & PDF herunterladen")
+    st.subheader("2. Bericht prüfen, unterschreiben & PDF laden")
 
     rep = st.session_state.last_report
 
@@ -341,6 +386,27 @@ if "last_report" in st.session_state and st.session_state.last_report:
         placeholder="z. B. Herr Weber",
     )
 
+    st.markdown("**Digitale Unterschrift des Kunden (optional direkt auf dem Display):**")
+    if "canvas_key" not in st.session_state:
+        st.session_state.canvas_key = 0
+
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 255, 255, 0.0)",
+        stroke_width=3,
+        stroke_color="#000000",
+        background_color="#F8F9FA",
+        height=140,
+        width=520,
+        drawing_mode="freedraw",
+        key=f"sig_canvas_{st.session_state.canvas_key}",
+    )
+
+    if st.button("🗑️ Unterschrift löschen"):
+        st.session_state.canvas_key += 1
+        st.rerun()
+
+    sig_bytes = extract_signature_bytes(canvas_result.image_data)
+
     updated_data = {
         "kunde": kunde_edit,
         "baustelle": baustelle_edit,
@@ -360,6 +426,7 @@ if "last_report" in st.session_state and st.session_state.last_report:
         daten=updated_data,
         unterzeichner_kunde=unterzeichner_name,
         logo_bytes=logo_bytes,
+        signature_bytes=sig_bytes,
     )
 
     safe_kunde = re.sub(r"[^a-zA-Z0-9_-]", "_", kunde_edit or "Kunde")
