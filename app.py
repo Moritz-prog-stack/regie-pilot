@@ -13,8 +13,8 @@ from google.genai import errors, types
 # Einstellungen: Modell-Reihenfolge & automatische Wiederholung
 # ---------------------------------------------------------
 MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
 ]
 RETRIES_PER_MODEL = 3
 RETRY_CODES = {429, 500, 502, 503, 504}
