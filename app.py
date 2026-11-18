@@ -163,6 +163,7 @@ def build_regiebericht_pdf(
     logo_bytes: bytes | None = None,
 ) -> bytes:
     pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
 
@@ -172,82 +173,93 @@ def build_regiebericht_pdf(
         with open(tmp_logo, "wb") as f:
             f.write(logo_bytes)
         try:
-            pdf.image(tmp_logo, x=155, y=12, w=40)
+            pdf.image(tmp_logo, x=155, y=12, w=38)
         except Exception:
             pass
 
     # Kopfbereich
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, clean_pdf_text(firma), ln=True)
+    pdf.cell(pdf.epw, 10, clean_pdf_text(firma), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 6, clean_pdf_text(f"Gewerk: {gewerk}  |  Datum: {datum_str}"), ln=True)
+    pdf.cell(pdf.epw, 6, clean_pdf_text(f"Gewerk: {gewerk}  |  Datum: {datum_str}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
     pdf.ln(6)
 
     pdf.set_draw_color(40, 40, 40)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
     pdf.ln(6)
 
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 9, "REGIEBERICHT / TAGESNACHWEIS", ln=True)
+    pdf.cell(pdf.epw, 9, "REGIEBERICHT / TAGESNACHWEIS", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
     # Stammdaten
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(42, 7, "Auftraggeber / Kunde:")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 7, clean_pdf_text(daten.get("kunde", "-")), ln=True)
+    label_w = 45
+    val_w = pdf.epw - label_w
 
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(42, 7, "Baustelle / Einsatzort:")
+    pdf.cell(label_w, 7, "Auftraggeber / Kunde:")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 7, clean_pdf_text(daten.get("baustelle", "-")), ln=True)
+    pdf.cell(val_w, 7, clean_pdf_text(daten.get("kunde", "-")), new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(42, 7, "Arbeitszeit / Personal:")
+    pdf.cell(label_w, 7, "Baustelle / Einsatzort:")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 7, clean_pdf_text(daten.get("arbeitszeit", "-")), ln=True)
+    pdf.cell(val_w, 7, clean_pdf_text(daten.get("baustelle", "-")), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(label_w, 7, "Arbeitszeit / Personal:")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(val_w, 7, clean_pdf_text(daten.get("arbeitszeit", "-")), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
 
     # Ausgeführte Arbeiten
+    pdf.set_x(pdf.l_margin)
     pdf.set_fill_color(240, 242, 246)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "  Ausgefuehrte Arbeiten", ln=True, fill=True)
+    pdf.cell(pdf.epw, 8, "  Ausgefuehrte Arbeiten", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
     arbeiten = daten.get("ausgefuehrte_arbeiten") or ["Keine Angaben"]
     for item in arbeiten:
-        pdf.multi_cell(0, 6, clean_pdf_text(f"- {item}"))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(pdf.epw, 6, clean_pdf_text(f"- {item}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     # Verwendetes Material
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "  Verwendetes Material", ln=True, fill=True)
+    pdf.cell(pdf.epw, 8, "  Verwendetes Material", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
     materialien = daten.get("material") or ["Kein Material angegeben"]
     for mat in materialien:
-        pdf.multi_cell(0, 6, clean_pdf_text(f"- {mat}"))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(pdf.epw, 6, clean_pdf_text(f"- {mat}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     # Besonderheiten / Hinweise
+    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "  Besonderheiten / Absprachen", ln=True, fill=True)
+    pdf.cell(pdf.epw, 8, "  Besonderheiten / Absprachen", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, clean_pdf_text(daten.get("besonderheiten", "-")))
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(pdf.epw, 6, clean_pdf_text(daten.get("besonderheiten", "-")), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(14)
 
     # Unterschriftsfelder
+    pdf.set_x(pdf.l_margin)
     y_sig = pdf.get_y()
-    pdf.line(12, y_sig, 92, y_sig)
-    pdf.line(112, y_sig, 192, y_sig)
+    pdf.line(15, y_sig, 90, y_sig)
+    pdf.line(115, y_sig, 195, y_sig)
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(100, 5, clean_pdf_text(f"Datum / Unterschrift {firma}"))
     kunde_label = f"Unterschrift Auftraggeber ({unterzeichner_kunde})" if unterzeichner_kunde else "Unterschrift Auftraggeber / Bauleitung"
-    pdf.cell(0, 5, clean_pdf_text(kunde_label), ln=True)
+    pdf.cell(pdf.epw - 100, 5, clean_pdf_text(kunde_label), new_x="LMARGIN", new_y="NEXT")
 
     return bytes(pdf.output())
 
