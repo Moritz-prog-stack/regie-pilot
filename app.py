@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -6,11 +7,10 @@ import time
 from datetime import date
 
 import streamlit as st
+import streamlit.components.v1 as components
 from fpdf import FPDF
 from google import genai
 from google.genai import errors, types
-from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 
 # ---------------------------------------------------------
 # Einstellungen: Modell-Reihenfolge & automatische Wiederholung
@@ -72,7 +72,7 @@ def check_access():
 check_access()
 
 # ---------------------------------------------------------
-# Hilfsfunktionen: Gemini API & PDF-Generierung
+# Hilfsfunktionen: Gemini API, Unterschrift & PDF-Generierung
 # ---------------------------------------------------------
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
@@ -164,17 +164,116 @@ Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt (ohne Markdown-Codeblöck
     raise RuntimeError(f"KI-Auswertung fehlgeschlagen: {last_error}")
 
 
-def extract_signature_bytes(canvas_image_data) -> bytes | None:
-    """Wandelt die gezeichnete Unterschrift vom Canvas in transparente/weiße PNG-Bytes um."""
-    if canvas_image_data is None:
+def decode_signature_base64(data_url: str) -> bytes | None:
+    """Wandelt eine Base64-Data-URL aus dem Touch-Pad in PNG-Bytes um."""
+    if not data_url:
         return None
-    # Prüfen, ob tatsächlich Striche gezeichnet wurden (Alpha-Kanal > 0)
-    if canvas_image_data[:, :, 3].max() == 0:
+    cleaned = data_url.strip()
+    if cleaned.startswith("data:image/png;base64,"):
+        cleaned = cleaned.split(",", 1)[1]
+    try:
+        return base64.b64decode(cleaned)
+    except Exception:
         return None
-    img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+
+
+def render_signature_pad():
+    """Eigenständiges HTML5-Touch-Unterschriftsfeld (ohne externe Python-Pakete)."""
+    html_code = """
+    <div style="font-family: sans-serif; background: #f8f9fa; border: 2px dashed #adb5bd; border-radius: 10px; padding: 10px;">
+        <canvas id="sig-canvas" width="520" height="150"
+            style="width: 100%; height: 150px; background: #ffffff; border-radius: 6px; touch-action: none; cursor: crosshair; display: block;">
+        </canvas>
+        <div style="display: flex; gap: 10px; margin-top: 8px; align-items: center;">
+            <button type="button" id="clear-btn"
+                style="padding: 6px 14px; border: 1px solid #ced4da; background: #ffffff; border-radius: 6px; cursor: pointer; font-size: 13px;">
+                🗑️ Löschen
+            </button>
+            <button type="button" id="copy-btn"
+                style="padding: 6px 14px; border: none; background: #0d6efd; color: white; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600;">
+                ✅ Unterschrift übernehmen
+            </button>
+            <span id="status-msg" style="font-size: 12px; color: #198754; font-weight: 600;"></span>
+        </div>
+    </div>
+    <script>
+        const canvas = document.getElementById("sig-canvas");
+        const ctx = canvas.getContext("2d");
+        const statusMsg = document.getElementById("status-msg");
+        let drawing = false;
+        let hasDrawn = false;
+
+        ctx.lineWidth = 3;
+        ctx.lineCap = "round";
+        ctx.strokeStyle = "#000000";
+
+        function getPos(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            return {
+                x: (clientX - rect.left) * scaleX,
+                y: (clientY - rect.top) * scaleY
+            };
+        }
+
+        function startDraw(e) {
+            e.preventDefault();
+            drawing = true;
+            hasDrawn = true;
+            const pos = getPos(e);
+            ctx.beginPath();
+            ctx.moveTo(pos.x, pos.y);
+        }
+
+        function draw(e) {
+            if (!drawing) return;
+            e.preventDefault();
+            const pos = getPos(e);
+            ctx.lineTo(pos.x, pos.y);
+            ctx.stroke();
+        }
+
+        function stopDraw(e) {
+            if (!drawing) return;
+            e.preventDefault();
+            drawing = false;
+        }
+
+        canvas.addEventListener("mousedown", startDraw);
+        canvas.addEventListener("mousemove", draw);
+        canvas.addEventListener("mouseup", stopDraw);
+        canvas.addEventListener("mouseout", stopDraw);
+
+        canvas.addEventListener("touchstart", startDraw, { passive: false });
+        canvas.addEventListener("touchmove", draw, { passive: false });
+        canvas.addEventListener("touchend", stopDraw, { passive: false });
+
+        document.getElementById("clear-btn").addEventListener("click", () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            hasDrawn = false;
+            statusMsg.textContent = "Feld geleert.";
+        });
+
+        document.getElementById("copy-btn").addEventListener("click", () => {
+            if (!hasDrawn) {
+                statusMsg.style.color = "#dc3545";
+                statusMsg.textContent = "Bitte zuerst unterschreiben!";
+                return;
+            }
+            const dataUrl = canvas.toDataURL("image/png");
+            navigator.clipboard.writeText(dataUrl).then(() => {
+                statusMsg.style.color = "#198754";
+                statusMsg.textContent = "Kopiert! Jetzt unten in das Feld einfügen.";
+            }).catch(() => {
+                prompt("Bitte diesen Code kopieren (Strg+C):", dataUrl);
+            });
+        });
+    </script>
+    """
+    components.html(html_code, height=215)
 
 
 def build_regiebericht_pdf(
@@ -386,26 +485,17 @@ if "last_report" in st.session_state and st.session_state.last_report:
         placeholder="z. B. Herr Weber",
     )
 
-    st.markdown("**Digitale Unterschrift des Kunden (optional direkt auf dem Display):**")
-    if "canvas_key" not in st.session_state:
-        st.session_state.canvas_key = 0
+    with st.expander("✍️ Digitale Kunden-Unterschrift hinzufügen (optional)", expanded=False):
+        st.caption("1. Im weißen Feld unterschreiben → 2. Auf **„Unterschrift übernehmen“** tippen → 3. Unten einfügen:")
+        render_signature_pad()
+        sig_data_input = st.text_input(
+            "Unterschrifts-Code hier einfügen (Strg+V / Einfügen)",
+            placeholder="Nach Klick auf 'Unterschrift übernehmen' hier einfügen...",
+        )
 
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 255, 255, 0.0)",
-        stroke_width=3,
-        stroke_color="#000000",
-        background_color="#F8F9FA",
-        height=140,
-        width=520,
-        drawing_mode="freedraw",
-        key=f"sig_canvas_{st.session_state.canvas_key}",
-    )
-
-    if st.button("🗑️ Unterschrift löschen"):
-        st.session_state.canvas_key += 1
-        st.rerun()
-
-    sig_bytes = extract_signature_bytes(canvas_result.image_data)
+    sig_bytes = decode_signature_base64(sig_data_input)
+    if sig_bytes:
+        st.success("✅ Digitale Unterschrift wird ins PDF eingefügt.")
 
     updated_data = {
         "kunde": kunde_edit,
