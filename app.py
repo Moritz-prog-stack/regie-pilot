@@ -9,12 +9,11 @@ from fpdf import FPDF
 from google import genai
 from google.genai import errors, types
 
-# ---------------------------------------------------------------------------
-# Einstellungen: Modell-Reihenfolge & automatische Wiederholung bei 503
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Einstellungen: Modell-Reihenfolge & automatische Wiederholung
+# ---------------------------------------------------------
 MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 ]
 RETRIES_PER_MODEL = 3
@@ -32,348 +31,333 @@ GEWERKE = [
     "Allgemeines Handwerk / Bau",
 ]
 
+# ---------------------------------------------------------
+# Seiten-Konfiguration (MUSS der erste st.-Befehl sein!)
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="Regie-Pilot | Regiebericht per KI",
+    page_title="Regie-Pilot",
     page_icon="🛠️",
     layout="centered",
 )
 
+# ---------------------------------------------------------
+# Zugangsschutz (Firmen-Code)
+# ---------------------------------------------------------
+def check_access():
+    # Master-Code: RP-7482-X (weitere Kunden-Codes über Streamlit Secrets)
+    allowed_codes = st.secrets.get("ACCESS_CODES", {"RP-7482-X": "Regie-Pilot Admin"})
 
-def bereinige_text(text: str) -> str:
-    """Macht deutsche Umlaute und Sonderzeichen für FPDF2 Standard-Schriften sicher."""
+    if "authenticated_company" not in st.session_state:
+        st.session_state.authenticated_company = None
+
+    if st.session_state.authenticated_company is None:
+        st.title("🔒 Regie-Pilot – Zugang")
+        st.write("Bitte geben Sie Ihren persönlichen Firmen-Code ein, um fortzufahren.")
+
+        code_input = st.text_input("Firmen-Code", type="password", placeholder="Firmen-Code eingeben")
+
+        if st.button("Anmelden", use_container_width=True):
+            cleaned_code = code_input.strip().upper()
+            if cleaned_code in allowed_codes:
+                st.session_state.authenticated_company = allowed_codes[cleaned_code]
+                st.rerun()
+            else:
+                st.error("❌ Ungültiger Firmen-Code. Bitte prüfen Sie Ihre Eingabe.")
+
+        st.stop()
+
+
+check_access()
+
+# ---------------------------------------------------------
+# Hilfsfunktionen: Gemini API & PDF-Generierung
+# ---------------------------------------------------------
+def get_gemini_client():
+    api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        st.error("❌ Kein GEMINI_API_KEY gefunden. Bitte in den Streamlit Secrets hinterlegen.")
+        st.stop()
+    return genai.Client(api_key=api_key)
+
+
+def clean_pdf_text(text: str) -> str:
+    """Säubert Sonderzeichen, damit Standard-PDF-Schriften fehlerfrei rendern."""
     if not text:
-        return ""
-    ersetzungen = {
+        return "-"
+    replacements = {
         "€": "EUR",
         "–": "-",
         "—": "-",
         "„": '"',
         "“": '"',
         "‚": "'",
-        "‘": "'",
-        "…": "...",
+        "’": "'",
         "•": "-",
     }
-    for alt, neu in ersetzungen.items():
-        text = text.replace(alt, neu)
-    return text.encode("latin-1", errors="replace").decode("latin-1")
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def hole_api_key() -> str:
-    """Lädt den API-Key bevorzugt aus Streamlit Secrets, sonst aus Umgebung oder Eingabe."""
-    if "GEMINI_API_KEY" in st.secrets:
-        return st.secrets["GEMINI_API_KEY"]
-    env_key = os.environ.get("GEMINI_API_KEY", "")
-    if env_key:
-        return env_key
-    return st.text_input("Gemini API-Key (nur nötig, falls noch nicht in Secrets hinterlegt)", type="password")
+def analyze_audio_with_gemini(audio_bytes: bytes, mime_type: str, gewerk: str, extra_notes: str) -> dict:
+    client = get_gemini_client()
+
+    prompt = f"""
+Du bist ein erfahrener deutscher Bauleiter und Handwerksmeister im Gewerk: {gewerk}.
+Analysiere die folgende Sprachnachricht von der Baustelle (und eventuelle Zusatznotizen: "{extra_notes}").
+Erstelle daraus einen professionellen, präzisen Regiebericht für den Kunden.
+
+Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt (ohne Markdown-Codeblöcke) in exakt dieser Struktur:
+{{
+  "kunde": "Name des Kunden / Auftraggebers (falls genannt, sonst 'Nicht angegeben')",
+  "baustelle": "Adresse oder Ort der Baustelle (falls genannt, sonst 'Nicht angegeben')",
+  "ausgefuehrte_arbeiten": [
+    "Sauber formulierter, fachgerechter Stichpunkt 1",
+    "Sauber formulierter, fachgerechter Stichpunkt 2"
+  ],
+  "material": [
+    "Menge + genaue Materialbezeichnung (falls genannt)"
+  ],
+  "arbeitszeit": "z. B. 2 Monteure à 3,5 Std. (falls genannt, sonst 'Nicht angegeben')",
+  "besonderheiten": "Hinweise, Mängel, Absprachen mit dem Kunden oder offene Punkte (falls keine, 'Keine besonderen Vorkommnisse')"
+}}
+"""
+
+    last_error = None
+    for model_name in MODELS:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw = response.text.strip()
+                raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+                return json.loads(raw)
+            except errors.APIError as e:
+                last_error = e
+                if getattr(e, "code", None) in RETRY_CODES and attempt < RETRIES_PER_MODEL - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+            except Exception as e:
+                last_error = e
+                break
+
+    raise RuntimeError(f"KI-Auswertung fehlgeschlagen: {last_error}")
 
 
-def erstelle_pdf(daten: dict, gewerk: str, mit_unterschrift: bool, firma_name: str) -> bytes:
-    """Erzeugt ein sauber formatiertes Regiebericht-PDF."""
+def build_regiebericht_pdf(
+    firma: str,
+    gewerk: str,
+    datum_str: str,
+    daten: dict,
+    unterzeichner_kunde: str = "",
+    logo_bytes: bytes | None = None,
+) -> bytes:
     pdf = FPDF()
-    pdf.set_margins(15, 15, 15)
+    pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    breite = pdf.epw  # Nutzbare Seitenbreite (180 mm)
+
+    # Optionales Firmenlogo oben rechts
+    if logo_bytes:
+        tmp_logo = "/tmp/company_logo.png"
+        with open(tmp_logo, "wb") as f:
+            f.write(logo_bytes)
+        try:
+            pdf.image(tmp_logo, x=155, y=12, w=40)
+        except Exception:
+            pass
 
     # Kopfbereich
-    pdf.set_x(pdf.l_margin)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(breite, 10, bereinige_text("REGIEBERICHT / STUNDENLOHNZETTEL"), ln=True)
-
+    pdf.cell(0, 10, clean_pdf_text(firma), ln=True)
     pdf.set_font("Helvetica", "", 10)
-    if firma_name.strip():
-        pdf.set_x(pdf.l_margin)
-        pdf.cell(breite, 6, bereinige_text(f"Ausführender Betrieb: {firma_name.strip()}"), ln=True)
-    pdf.set_x(pdf.l_margin)
-    pdf.cell(
-        breite,
-        6,
-        bereinige_text(f"Gewerk: {gewerk}   |   Datum: {daten.get('datum', date.today().strftime('%d.%m.%Y'))}"),
-        ln=True,
-    )
-    pdf.ln(4)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6, clean_pdf_text(f"Gewerk: {gewerk}  |  Datum: {datum_str}"), ln=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(6)
 
-    # Trennlinie
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + breite, pdf.get_y())
+    pdf.set_draw_color(40, 40, 40)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 9, "REGIEBERICHT / TAGESNACHWEIS", ln=True)
+    pdf.ln(3)
+
+    # Stammdaten
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(42, 7, "Auftraggeber / Kunde:")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, clean_pdf_text(daten.get("kunde", "-")), ln=True)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(42, 7, "Baustelle / Einsatzort:")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, clean_pdf_text(daten.get("baustelle", "-")), ln=True)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(42, 7, "Arbeitszeit / Personal:")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, clean_pdf_text(daten.get("arbeitszeit", "-")), ln=True)
     pdf.ln(5)
-
-    # Kunde & Baustelle
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(breite, 8, bereinige_text("1. Kunde & Baustelle"), ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_x(pdf.l_margin)
-    pdf.cell(breite, 6, bereinige_text(f"Kunde / Auftraggeber: {daten.get('kunde', '-')}"), ln=True)
-    pdf.set_x(pdf.l_margin)
-    pdf.cell(breite, 6, bereinige_text(f"Baustelle / Einsatzort: {daten.get('baustelle', '-')}"), ln=True)
-    pdf.ln(4)
 
     # Ausgeführte Arbeiten
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(breite, 8, bereinige_text("2. Ausgeführte Arbeiten"), ln=True)
+    pdf.set_fill_color(240, 242, 246)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "  Ausgefuehrte Arbeiten", ln=True, fill=True)
+    pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
-    arbeiten = daten.get("arbeiten", [])
-    if arbeiten:
-        for punkt in arbeiten:
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(breite, 6, bereinige_text(f"- {punkt}"))
-    else:
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(breite, 6, bereinige_text("- Keine Tätigkeiten angegeben."))
+    arbeiten = daten.get("ausgefuehrte_arbeiten") or ["Keine Angaben"]
+    for item in arbeiten:
+        pdf.multi_cell(0, 6, clean_pdf_text(f"- {item}"))
     pdf.ln(4)
 
-    # Arbeitszeiten & Personal (Gesamtbreite = 180 mm)
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(breite, 8, bereinige_text("3. Arbeitszeiten & Mitarbeiter"), ln=True)
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(240, 240, 240)
-    pdf.cell(70, 7, bereinige_text("Mitarbeiter / Qualifikation"), border=1, fill=True)
-    pdf.cell(45, 7, bereinige_text("Zeitraum"), border=1, fill=True)
-    pdf.cell(30, 7, bereinige_text("Pause (Min)"), border=1, fill=True)
-    pdf.cell(35, 7, bereinige_text("Netto-Stunden"), border=1, fill=True, ln=True)
-
+    # Verwendetes Material
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "  Verwendetes Material", ln=True, fill=True)
+    pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
-    mitarbeiter = daten.get("mitarbeiter", [])
-    gesamt_stunden = 0.0
-    if mitarbeiter:
-        for m in mitarbeiter:
-            std = float(m.get("netto_stunden", 0))
-            gesamt_stunden += std
-            pdf.set_x(pdf.l_margin)
-            pdf.cell(70, 7, bereinige_text(str(m.get("name", "Monteur"))), border=1)
-            pdf.cell(45, 7, bereinige_text(str(m.get("zeitraum", "-"))), border=1)
-            pdf.cell(30, 7, bereinige_text(str(m.get("pause_min", 0))), border=1)
-            pdf.cell(35, 7, bereinige_text(f"{std:.2f} Std."), border=1, ln=True)
-    else:
-        pdf.set_x(pdf.l_margin)
-        pdf.cell(breite, 7, bereinige_text("Keine Arbeitszeiten erfasst"), border=1, ln=True)
+    materialien = daten.get("material") or ["Kein Material angegeben"]
+    for mat in materialien:
+        pdf.multi_cell(0, 6, clean_pdf_text(f"- {mat}"))
+    pdf.ln(4)
 
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(145, 7, bereinige_text("Gesamtstunden:"), border=1, align="R")
-    pdf.cell(35, 7, bereinige_text(f"{gesamt_stunden:.2f} Std."), border=1, ln=True)
-    pdf.ln(5)
-
-    # Verbrauchtes Material (Gesamtbreite = 180 mm)
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(breite, 8, bereinige_text("4. Verbrauchtes Material"), ln=True)
-    pdf.set_x(pdf.l_margin)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(35, 7, bereinige_text("Menge"), border=1, fill=True)
-    pdf.cell(145, 7, bereinige_text("Materialbezeichnung"), border=1, fill=True, ln=True)
-
+    # Besonderheiten / Hinweise
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "  Besonderheiten / Absprachen", ln=True, fill=True)
+    pdf.ln(2)
     pdf.set_font("Helvetica", "", 10)
-    material = daten.get("material", [])
-    if material:
-        for item in material:
-            pdf.set_x(pdf.l_margin)
-            pdf.cell(35, 7, bereinige_text(str(item.get("menge", "-"))), border=1)
-            pdf.cell(145, 7, bereinige_text(str(item.get("bezeichnung", "-"))), border=1, ln=True)
-    else:
-        pdf.set_x(pdf.l_margin)
-        pdf.cell(breite, 7, bereinige_text("Kein Material verbraucht / angegeben"), border=1, ln=True)
-    pdf.ln(5)
+    pdf.multi_cell(0, 6, clean_pdf_text(daten.get("besonderheiten", "-")))
+    pdf.ln(14)
 
-    # Hinweise / Mängel / Nachträge
-    hinweise = str(daten.get("hinweise", "") or "").strip()
-    if hinweise:
-        pdf.set_x(pdf.l_margin)
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(breite, 8, bereinige_text("5. Besondere Hinweise / Nachträge"), ln=True)
-        pdf.set_x(pdf.l_margin)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(breite, 6, bereinige_text(hinweise))
-        pdf.ln(6)
-
-    # Unterschriftsfeld
-    if mit_unterschrift:
-        pdf.ln(8)
-        pdf.set_x(pdf.l_margin)
-        y_pos = pdf.get_y()
-        pdf.line(pdf.l_margin, y_pos, pdf.l_margin + 80, y_pos)
-        pdf.line(pdf.l_margin + 100, y_pos, pdf.l_margin + breite, y_pos)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_x(pdf.l_margin)
-        pdf.cell(100, 5, bereinige_text("Datum, Unterschrift Monteur / Bauleiter"))
-        pdf.cell(80, 5, bereinige_text("Datum, Unterschrift Auftraggeber / Kunde"), ln=True)
+    # Unterschriftsfelder
+    y_sig = pdf.get_y()
+    pdf.line(12, y_sig, 92, y_sig)
+    pdf.line(112, y_sig, 192, y_sig)
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(100, 5, clean_pdf_text(f"Datum / Unterschrift {firma}"))
+    kunde_label = f"Unterschrift Auftraggeber ({unterzeichner_kunde})" if unterzeichner_kunde else "Unterschrift Auftraggeber / Bauleitung"
+    pdf.cell(0, 5, clean_pdf_text(kunde_label), ln=True)
 
     return bytes(pdf.output())
 
 
-def analysiere_eingabe(client: genai.Client, gewerk: str, text_notiz: str, audio_bytes: bytes | None, audio_mime: str | None) -> tuple[dict, str]:
-    """Sendet Text und/oder Sprachaufnahme an Gemini mit automatischem Retry & Modell-Fallback."""
-    heute = date.today().strftime("%d.%m.%Y")
-    system_prompt = f"""
-Du bist ein erfahrener deutscher Bauleiter und Abrechnungs-Experte für das Gewerk "{gewerk}".
-Analysiere die Baustellen-Notiz (Text und/oder Sprachaufnahme) und wandle sie in einen abrechnungsfertigen Regiebericht um.
-Heutiges Datum (falls kein anderes genannt wird): {heute}.
+# ---------------------------------------------------------
+# Hauptoberfläche der App
+# ---------------------------------------------------------
+col_head, col_logout = st.columns([4, 1])
+with col_head:
+    st.title("🛠️ Regie-Pilot")
+    st.caption(f"Angemeldet als: **{st.session_state.authenticated_company}**")
+with col_logout:
+    st.write("")
+    if st.button("Abmelden"):
+        st.session_state.authenticated_company = None
+        st.rerun()
 
-Wichtige Regeln:
-- Formuliere die ausgeführten Arbeiten fachgerecht, klar und kundenfreundlich auf Deutsch (perfekt für eine Rechnung).
-- Berechne die Netto-Stunden pro Mitarbeiter exakt (Bruttozeit minus Pause in Stunden als Dezimalzahl, z. B. 7.75 für 7 Std. 45 Min.).
-- Falls mehrere Monteure genannt werden (z. B. "Lukas und ich"), führe beide getrennt in der Mitarbeiterliste auf.
-- Trenne Mengen und Materialbezeichnungen sauber.
-- Antworte AUSSCHLIESSLICH mit validem JSON exakt nach diesem Schema:
-{{
-  "datum": "TT.MM.JJJJ",
-  "kunde": "Name des Kunden oder 'Nicht angegeben'",
-  "baustelle": "Adresse oder Einsatzort oder 'Nicht angegeben'",
-  "arbeiten": ["Fachgerechter Tätigkeitspunkt 1", "Fachgerechter Tätigkeitspunkt 2"],
-  "mitarbeiter": [
-    {{
-      "name": "Name oder Rolle (z. B. Monteur 1)",
-      "zeitraum": "z. B. 07:30 - 16:00 Uhr",
-      "pause_min": 45,
-      "netto_stunden": 7.75
-    }}
-  ],
-  "material": [
-    {{
-      "menge": "z. B. 3 m",
-      "bezeichnung": "Kupferrohr 22 mm"
-    }}
-  ],
-  "hinweise": "Besondere Hinweise, Restarbeiten, Mängel oder leerer String"
-}}
-"""
+st.divider()
 
-    contents = [system_prompt]
-    if audio_bytes and audio_mime:
-        contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime))
-    if text_notiz.strip():
-        contents.append(f"Zusätzliche Text-Notiz vom Monteur:\n{text_notiz.strip()}")
+with st.expander("⚙️ Firmendaten & Logo anpassen", expanded=False):
+    firma_name = st.text_input("Firmenname im PDF", value=st.session_state.authenticated_company)
+    gewerk = st.selectbox("Gewerk auswählen", GEWERKE, index=0)
+    einsatz_datum = st.date_input("Einsatzdatum", value=date.today())
+    logo_file = st.file_uploader("Firmenlogo hochladen (PNG / JPG, optional)", type=["png", "jpg", "jpeg"])
 
-    letzter_fehler = None
-    for modell in MODELS:
-        for versuch in range(RETRIES_PER_MODEL):
-            try:
-                response = client.models.generate_content(
-                    model=modell,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
-                )
-                roh_text = response.text.strip()
-                roh_text = re.sub(r"^```json\s*|\s*```$", "", roh_text)
-                return json.loads(roh_text), modell
-            except errors.APIError as e:
-                letzter_fehler = e
-                if e.code == 404:
-                    break
-                if e.code in RETRY_CODES:
-                    time.sleep(2 * (versuch + 1))
-                    continue
-                raise
-            except Exception as e:
-                letzter_fehler = e
-                time.sleep(1)
+st.subheader("1. Baustellen-Bericht einsprechen")
+st.write("Sprechen Sie einfach frei ein: **Kunde, Baustelle, erledigte Arbeiten, Material und Stunden.**")
 
-    raise RuntimeError(f"Die KI-Server sind gerade stark ausgelastet. Bitte in 10 Sekunden nochmal tippen. (Details: {letzter_fehler})")
-
-
-# ---------------------------------------------------------------------------
-# Benutzeroberfläche (UI)
-# ---------------------------------------------------------------------------
-st.title("🛠️ Regie-Pilot: WhatsApp-Chaos zu Regiebericht")
-st.caption("Abrechnungsfertiger Regiebericht & PDF-Stundenlohnzettel in Sekunden – per Sprache oder Text.")
-
-api_key = hole_api_key()
-
-gewerk = st.selectbox("1. Gewerk auswählen:", GEWERKE)
-
-st.markdown("### 2. Sprachnotiz direkt einsprechen (oder Text eingeben)")
-audio_aufnahme = st.audio_input("🎙️ Mikrofon antippen und Baustellen-Bericht einsprechen")
-
-with st.expander("📁 Optional: Vorhandene Audio-Datei hochladen (MP3, WAV, M4A, OGG)"):
-    audio_upload = st.file_uploader("Audiodatei auswählen", type=["mp3", "wav", "m4a", "ogg"])
-
-text_notiz = st.text_area(
-    "✍️ Baustellen-Notiz als Text (optional oder ergänzend):",
-    placeholder="z. B.: Moin Chef, waren heute bei Familie König in Düren, Lukas und ich von 07:30 bis 16:00 Uhr, 45 Min Pause. Neue Umwälzpumpe Grundfos Alpha2 eingebaut, 3m Kupferrohr 22mm verbraucht...",
-    height=130,
+audio_data = st.audio_input("Mikrofon antippen zum Aufnehmen")
+extra_notes = st.text_area(
+    "Optionale Zusatznotizen (falls etwas ergänzt werden soll)",
+    placeholder="z. B. Nachtrag mit Herrn Müller vor Ort besprochen...",
+    height=75,
 )
 
-with st.expander("⚙️ Optionen für den Stundenlohnzettel / PDF"):
-    firma_name = st.text_input("Eigener Firmenname im Briefkopf (optional):", placeholder="z. B. Mustermann Haustechnik GmbH")
-    mit_unterschrift = st.checkbox("Unterschriftsfelder für Monteur & Kunde ins PDF drucken", value=True)
+if st.button("📄 Regiebericht erstellen", type="primary", use_container_width=True):
+    if audio_data is None:
+        st.warning("⚠️ Bitte nehmen Sie zuerst eine Sprachnachricht auf.")
+    else:
+        with st.spinner("KI erstellt Ihren Regiebericht..."):
+            try:
+                audio_bytes = audio_data.read()
+                mime_type = audio_data.type or "audio/wav"
+                result_data = analyze_audio_with_gemini(audio_bytes, mime_type, gewerk, extra_notes)
+                st.session_state.last_report = result_data
+            except Exception as err:
+                st.error(f"Fehler bei der Erstellung: {err}")
 
-if st.button("🚀 Regiebericht & PDF erstellen", type="primary", use_container_width=True):
-    if not api_key:
-        st.error("Bitte hinterlege zuerst deinen Gemini API-Key in den Streamlit Secrets.")
-        st.stop()
+# ---------------------------------------------------------
+# Ergebnis prüfen, anpassen & PDF herunterladen
+# ---------------------------------------------------------
+if "last_report" in st.session_state and st.session_state.last_report:
+    st.divider()
+    st.subheader("2. Bericht prüfen & PDF herunterladen")
 
-    aktive_audio = audio_aufnahme if audio_aufnahme is not None else audio_upload
-    if aktive_audio is None and not text_notiz.strip():
-        st.warning("Bitte sprich zuerst eine kurze Sprachnotiz ein oder gib eine Text-Notiz ein.")
-        st.stop()
+    rep = st.session_state.last_report
 
-    audio_bytes = None
-    audio_mime = None
-    if aktive_audio is not None:
-        audio_bytes = aktive_audio.getvalue()
-        audio_mime = getattr(aktive_audio, "type", None) or "audio/wav"
+    kunde_edit = st.text_input("Kunde / Auftraggeber", value=rep.get("kunde", ""))
+    baustelle_edit = st.text_input("Baustelle / Ort", value=rep.get("baustelle", ""))
+    zeit_edit = st.text_input("Arbeitszeit / Personal", value=rep.get("arbeitszeit", ""))
 
-    with st.spinner("KI wertet Baustellen-Bericht aus und erstellt PDF..."):
-        try:
-            client = genai.Client(api_key=api_key)
-            daten, verwendetes_modell = analysiere_eingabe(
-                client=client,
-                gewerk=gewerk,
-                text_notiz=text_notiz,
-                audio_bytes=audio_bytes,
-                audio_mime=audio_mime,
-            )
-            pdf_bytes = erstelle_pdf(
-                daten=daten,
-                gewerk=gewerk,
-                mit_unterschrift=mit_unterschrift,
-                firma_name=firma_name,
-            )
+    arbeiten_text = st.text_area(
+        "Ausgeführte Arbeiten (eine Zeile pro Punkt)",
+        value="\n".join(rep.get("ausgefuehrte_arbeiten", [])),
+        height=120,
+    )
+    material_text = st.text_area(
+        "Verwendetes Material (eine Zeile pro Position)",
+        value="\n".join(rep.get("material", [])),
+        height=90,
+    )
+    besonderheiten_edit = st.text_area(
+        "Besonderheiten / Absprachen",
+        value=rep.get("besonderheiten", ""),
+        height=70,
+    )
+    unterzeichner_name = st.text_input(
+        "Name des Unterzeichners beim Kunden (optional für PDF)",
+        placeholder="z. B. Herr Weber",
+    )
 
-            st.success(f"Fertig! Regiebericht erfolgreich erstellt (Modell: {verwendetes_modell})")
+    updated_data = {
+        "kunde": kunde_edit,
+        "baustelle": baustelle_edit,
+        "arbeitszeit": zeit_edit,
+        "ausgefuehrte_arbeiten": [line.strip() for line in arbeiten_text.splitlines() if line.strip()],
+        "material": [line.strip() for line in material_text.splitlines() if line.strip()],
+        "besonderheiten": besonderheiten_edit,
+    }
 
-            # Vorschau direkt in der App
-            col1, col2 = st.columns(2)
-            col1.metric("Kunde", daten.get("kunde", "-"))
-            col2.metric("Baustelle", daten.get("baustelle", "-"))
+    logo_bytes = logo_file.read() if logo_file is not None else None
+    datum_formatted = einsatz_datum.strftime("%d.%m.%Y")
 
-            st.subheader("Ausgeführte Arbeiten")
-            for a in daten.get("arbeiten", []):
-                st.write(f"• {a}")
+    pdf_bytes = build_regiebericht_pdf(
+        firma=firma_name,
+        gewerk=gewerk,
+        datum_str=datum_formatted,
+        daten=updated_data,
+        unterzeichner_kunde=unterzeichner_name,
+        logo_bytes=logo_bytes,
+    )
 
-            st.subheader("Arbeitszeiten")
-            for m in daten.get("mitarbeiter", []):
-                st.write(f"• **{m.get('name')}**: {m.get('zeitraum')} (Pause: {m.get('pause_min')} Min.) → **{m.get('netto_stunden')} Std.**")
+    safe_kunde = re.sub(r"[^a-zA-Z0-9_-]", "_", kunde_edit or "Kunde")
+    file_name = f"Regiebericht_{safe_kunde}_{einsatz_datum.strftime('%Y-%m-%d')}.pdf"
 
-            if daten.get("material"):
-                st.subheader("Verbrauchtes Material")
-                for mat in daten.get("material", []):
-                    st.write(f"• {mat.get('menge')} – {mat.get('bezeichnung')}")
-
-            if daten.get("hinweise"):
-                st.info(f"**Hinweis:** {daten.get('hinweise')}")
-
-            # PDF-Download
-            kunde_sauber = re.sub(r"[^a-zA-Z0-9_-]", "_", daten.get("kunde", "Kunde"))
-            dateiname = f"Regiebericht_{kunde_sauber}_{date.today().strftime('%Y-%m-%d')}.pdf"
-
-            st.download_button(
-                label="📄 Regiebericht als PDF herunterladen",
-                data=pdf_bytes,
-                file_name=dateiname,
-                mime="application/pdf",
-                type="primary",
-                use_container_width=True,
-            )
-
-        except Exception as fehler:
-            st.error(f"Beim Erstellen des Berichts ist ein Fehler aufgetreten: {fehler}")
+    st.download_button(
+        label="⬇️ Fertiges PDF herunterladen",
+        data=pdf_bytes,
+        file_name=file_name,
+        mime="application/pdf",
+        type="primary",
+        use_container_width=True,
+    )
